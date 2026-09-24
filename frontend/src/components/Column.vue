@@ -27,11 +27,12 @@
 
     <div class="column-cards">
       <draggable
-        :model-value="cards"
+        v-model="cardModel"
         item-key="id"
         group="cards"
         ghost-class="card-ghost"
         animation="200"
+        :data-column-id="column.id"
         @end="onCardDragEnd"
       >
         <template #item="{ element: card }">
@@ -55,11 +56,10 @@
 </template>
 
 <script setup>
-import { ref, nextTick } from 'vue'
+import { ref, computed, nextTick } from 'vue'
 import { MoreFilled, Plus } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import TaskCard from './TaskCard.vue'
-import { cardApi } from '../api/index.js'
 
 const props = defineProps({
   column: { type: Object, required: true },
@@ -67,11 +67,19 @@ const props = defineProps({
   allColumns: { type: Array, default: () => [] }
 })
 
-const emit = defineEmits(['add-card', 'edit-card', 'delete-card', 'move-card', 'rename-column', 'delete-column'])
+const emit = defineEmits(['add-card', 'edit-card', 'delete-card', 'move-card', 'rename-column', 'delete-column', 'update:cards'])
 
 const isEditing = ref(false)
 const editName = ref('')
 const editInputRef = ref(null)
+
+// Two-way binding for drag & drop: vuedraggable mutates this computed and the
+// change is written straight back to the board store, so every column's count
+// and the drag indices used by the next move always reflect reality.
+const cardModel = computed({
+  get: () => props.cards,
+  set: list => emit('update:cards', list)
+})
 
 function startEditing() {
   editName.value = props.column.name
@@ -96,26 +104,16 @@ function handleCommand(command) {
   }
 }
 
-async function onCardDragEnd(evt) {
+function onCardDragEnd(evt) {
+  // SortableJS fires "end" exactly once, on the source sortable. The
+  // destination column is therefore always read from evt.to (marked with its
+  // column id), never from this component, which owns the source column.
   const cardId = evt.item?.__draggable_context?.element?.id
-  const toColumnId = props.column.id
-  
-  // Find source column
-  const fromContext = evt.from.__draggable_context
-  const toContext = evt.to.__draggable_context
-  
-  if (!cardId) return
-  
-  const newIndex = evt.newIndex
-  
-  // If moved to a different column, update via API
-  if (evt.from !== evt.to) {
-    try {
-      await cardApi.move(cardId, toColumnId, newIndex)
-    } catch (err) {
-      // Refresh would be needed here, but the store handles it
-    }
-  }
+  const toColumnId = Number(evt.to?.dataset?.columnId)
+  if (!cardId || !Number.isInteger(toColumnId)) return
+  if (evt.from === evt.to && evt.oldIndex === evt.newIndex) return
+
+  emit('move-card', cardId, toColumnId, evt.newIndex)
 }
 </script>
 

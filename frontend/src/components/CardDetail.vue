@@ -105,6 +105,8 @@ async function handleSave() {
 
   saving.value = true
   try {
+    // 1. Content update: never part of the move, so card content is preserved
+    //    independently of which column the card ends up in.
     const updated = await boardStore.updateCard(props.card.id, {
       title: form.value.title,
       description: form.value.description,
@@ -112,17 +114,20 @@ async function handleSave() {
       due_date: form.value.due_date || null
     })
     emit('updated', updated)
-    ElMessage.success('Card updated')
 
-    // Handle move if target column selected
-    if (moveTarget.value && moveTarget.value !== props.card.column_id) {
-      await boardStore.moveCard(props.card.id, moveTarget.value, 0)
+    // 2. Move (optional) goes through the same serialized rule as drag and menu
+    //    moves. On failure the store has already resynced; keep the dialog open
+    //    so the user can retry.
+    if (moveTarget.value && moveTarget.value !== updated.column_id) {
+      const moved = await boardStore.moveCard(props.card.id, moveTarget.value, 0)
+      emit('updated', moved)
       ElMessage.success('Card moved')
     }
 
+    ElMessage.success('Card updated')
     emit('update:visible', false)
   } catch (err) {
-    ElMessage.error('Failed to update card')
+    ElMessage.error('Failed to save card changes')
   } finally {
     saving.value = false
   }

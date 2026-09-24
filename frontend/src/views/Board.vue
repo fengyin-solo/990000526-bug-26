@@ -29,7 +29,7 @@
         <template #item="{ element: column }">
           <Column
             :column="column"
-            :cards="boardStore.cards[column.id] || []"
+            v-model:cards="boardStore.cards[column.id]"
             :all-columns="boardStore.columns"
             @add-card="handleAddCard"
             @edit-card="openCardDetail"
@@ -172,6 +172,7 @@ async function handleMoveCard(cardId, targetColumnId, position) {
     await boardStore.moveCard(cardId, targetColumnId, position)
     ElMessage.success('Card moved')
   } catch (err) {
+    // moveCard already restored local state from the server on failure.
     ElMessage.error('Failed to move card')
   }
 }

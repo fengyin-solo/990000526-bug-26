@@ -162,16 +162,29 @@ router.delete('/cards/:id', (req, res) => {
   }
 });
 
-// PUT /api/cards/:id/move - Move card to another column
+// PUT /api/cards/:id/move - Move card to another column (or reorder within one)
+//
+// Unified position rule shared by drag, menu move, detail dialog and retries:
+//   - position is the insertion index in the target column's card list
+//   - valid range: [0, peerCount], where peerCount is the number of other
+//     cards in the target column (n-1 for same-column reorder, n for a
+//     cross-column move)
+//   - out-of-range positions are clamped to the range, never to a gap
+//   - on success every affected column is normalized back to a gap-free 0..n-1
+//     sequence, so a retry or a fresh page load always observes the same state
 router.put('/cards/:id/move', (req, res) => {
-  const { columnId, position } = req.body;
-  if (!columnId) {
+  const { columnId } = req.body;
+  const position = req.body.position;
+
+  const targetColumnId = Number(columnId);
+  if (!Number.isInteger(targetColumnId)) {
     return res.status(400).json({ error: 'Target column ID is required' });
   }
 
   const db = getDb();
   try {
-    const card = getCardWithOwnership(db, req.params.id, req.user.id);
+    const cardId = Number(req.params.id);
+    const card = getCardWithOwnership(db, cardId, req.user.id);
     if (!card || card.user_id !== req.user.id) {
       db.close();
       return res.status(404).json({ error: 'Card not found' });
@@ -179,42 +192,77 @@ router.put('/cards/:id/move', (req, res) => {
 
     // Verify target column belongs to same board and user
     const targetCol = db.prepare(`
-      SELECT col.*, b.user_id FROM columns col 
-      JOIN boards b ON col.board_id = b.id 
+      SELECT col.*, b.user_id FROM columns col
+      JOIN boards b ON col.board_id = b.id
       WHERE col.id = ? AND col.board_id = ?
-    `).get(columnId, card.board_id);
+    `).get(targetColumnId, card.board_id);
 
     if (!targetCol || targetCol.user_id !== req.user.id) {
       db.close();
       return res.status(404).json({ error: 'Target column not found in this board' });
     }
 
-    const oldColumnId = card.column_id;
-    const oldPosition = card.position;
+    const sameColumn = card.column_id === targetColumnId;
 
-    // Get max position in target column
-    const maxPos = db.prepare('SELECT MAX(position) AS maxPos FROM cards WHERE column_id = ?').get(columnId);
-    const newPosition = position !== undefined ? Math.min(position, (maxPos.maxPos ?? -1) + 1) : (maxPos.maxPos ?? -1) + 1;
+    // Clamp to the single valid range, regardless of how the move was requested.
+    // peerCount counts the other cards currently in the target column; after
+    // the moved card is parked out, they occupy slots 0..peerCount-1, so the
+    // last valid insertion index is peerCount (both same- and cross-column).
+    const peerCount = db.prepare(`
+      SELECT COUNT(*) AS n FROM cards WHERE column_id = ? AND id != ?
+    `).get(targetColumnId, cardId).n;
+    const upperBound = peerCount;
+    let targetPosition;
+    if (position === undefined || position === null) {
+      targetPosition = upperBound;
+    } else {
+      const requested = Number(position);
+      if (!Number.isInteger(requested)) {
+        db.close();
+        return res.status(400).json({ error: 'Position must be an integer' });
+      }
+      targetPosition = Math.min(Math.max(requested, 0), upperBound);
+    }
 
-    // Remove card from old position (shift cards down in old column)
-    db.prepare(`
-      UPDATE cards SET position = position - 1 
-      WHERE column_id = ? AND position > ?
-    `).run(oldColumnId, oldPosition);
+    const renumberStmt = db.prepare('UPDATE cards SET position = ? WHERE id = ?');
+    const renumberColumn = (columnIdToCompact) => {
+      const ids = db.prepare(`
+        SELECT id FROM cards
+        WHERE column_id = ?
+        ORDER BY position ASC, id ASC
+      `).all(columnIdToCompact).map(row => row.id);
+      ids.forEach((id, index) => renumberStmt.run(index, id));
+    };
 
-    // Make room in target column (shift cards up in target column)
-    db.prepare(`
-      UPDATE cards SET position = position + 1 
-      WHERE column_id = ? AND position >= ?
-    `).run(columnId, newPosition);
+    const applyMove = db.transaction(() => {
+      // Park the moved card outside the position slots so no unique ordering
+      // tie is possible while the columns are rebuilt.
+      db.prepare(`
+        UPDATE cards
+        SET column_id = ?, position = -1, updated_at = datetime('now')
+        WHERE id = ?
+      `).run(targetColumnId, cardId);
 
-    // Move the card
-    db.prepare(`
-      UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now') 
-      WHERE id = ?
-    `).run(columnId, newPosition, req.params.id);
+      // Compact the source column first for cross-column moves.
+      if (!sameColumn) {
+        renumberColumn(card.column_id);
+      }
 
-    const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(req.params.id);
+      // Rebuild the target column around the moved card. This is idempotent,
+      // so a retried request converges to the same gap-free result.
+      const targetIds = db.prepare(`
+        SELECT id FROM cards
+        WHERE column_id = ? AND id != ?
+        ORDER BY position ASC, id ASC
+      `).all(targetColumnId, cardId).map(row => row.id);
+      targetIds.splice(targetPosition, 0, cardId);
+      targetIds.forEach((id, index) => renumberStmt.run(index, id));
+    });
+
+    applyMove();
+
+    // Card content (title/description/priority/due_date) is untouched.
+    const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(cardId);
     db.close();
     res.json(updated);
   } catch (err) {

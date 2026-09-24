@@ -37,11 +37,13 @@ export const useBoardStore = defineStore('board', () => {
     try {
       const res = await columnApi.list(boardId)
       columns.value = res.data
-      // Initialize cards map
-      cards.value = {}
+      // Preserve already-loaded cards while initializing new columns; wiping
+      // the map here would briefly make every column's count read 0.
+      const nextCards = {}
       for (const col of res.data) {
-        cards.value[col.id] = []
+        nextCards[col.id] = cards.value[col.id] || []
       }
+      cards.value = nextCards
     } finally {
       loading.value = false
     }
@@ -120,25 +122,111 @@ export const useBoardStore = defineStore('board', () => {
     }
   }
 
-  async function moveCard(cardId, targetColumnId, position) {
-    const res = await cardApi.move(cardId, targetColumnId, position)
-    // Remove card from old column and add to new column
+  // --- Card moves ----------------------------------------------------------
+  // Single source of truth for cross-column movement and in-column reordering,
+  // used identically by drag & drop, card menu move, detail dialog and retries.
+  //
+  // Rules (mirrored by the backend /api/cards/:id/move endpoint):
+  //   * position is the insertion index inside the target column
+  //   * same-column range is [0, n-1], cross-column range is [0, n]
+  //   * the server response is the only canonical result
+  //   * on failure the whole board is refetched so local and server state can
+  //     never diverge (no card can remain in two columns)
+  let moveQueue = Promise.resolve()
+
+  function findCard(cardId) {
+    for (const colId in cards.value) {
+      const list = cards.value[colId]
+      const idx = list.findIndex(c => c.id === cardId)
+      if (idx !== -1) return { columnId: Number(colId), index: idx, list }
+    }
+    return null
+  }
+
+  // Rewrite local state to "card is at target index", regardless of its
+  // previous state. Idempotent: calling it again with the same arguments
+  // produces the same arrays, which is what makes retries safe.
+  function applyLocalMove(cardId, targetColumnId, targetIndex) {
     let movedCard = null
     for (const colId in cards.value) {
-      const idx = cards.value[colId].findIndex(c => c.id === cardId)
+      const list = cards.value[colId]
+      const idx = list.findIndex(c => c.id === cardId)
       if (idx !== -1) {
-        movedCard = cards.value[colId].splice(idx, 1)[0]
-        break
+        movedCard = list[idx]
+        cards.value[colId] = list.filter(c => c.id !== cardId)
       }
     }
-    if (movedCard) {
-      movedCard.column_id = targetColumnId
-      movedCard.position = position
-      if (!cards.value[targetColumnId]) cards.value[targetColumnId] = []
-      // Insert at position
-      cards.value[targetColumnId].splice(position, 0, movedCard)
+    if (!movedCard) return false
+    if (!cards.value[targetColumnId]) cards.value[targetColumnId] = []
+    const list = [...cards.value[targetColumnId]]
+    const clamped = Math.min(Math.max(targetIndex, 0), list.length)
+    movedCard = { ...movedCard, column_id: targetColumnId }
+    list.splice(clamped, 0, movedCard)
+    cards.value[targetColumnId] = list
+    return true
+  }
+
+  function renumberAll() {
+    for (const colId in cards.value) {
+      cards.value[colId].forEach((card, index) => {
+        if (card.position !== index || card.column_id !== Number(colId)) {
+          card.position = index
+          card.column_id = Number(colId)
+        }
+      })
     }
-    return res.data
+  }
+
+  // Recovery standard: reload all cards from the server. Used for every failed
+  // move, so drag, menu, dialog and re-entry converge to the same state.
+  async function resyncCards() {
+    const boardId = currentBoard.value?.id
+    if (boardId) await fetchAllCards(boardId)
+  }
+
+  function moveCard(cardId, targetColumnId, position) {
+    targetColumnId = Number(targetColumnId)
+    const task = moveQueue.then(async () => {
+      const before = findCard(cardId)
+      if (!before) {
+        await resyncCards()
+        throw new Error('Card not found in current board state')
+      }
+      if (!columns.value.some(col => Number(col.id) === targetColumnId)) {
+        await resyncCards()
+        throw new Error('Target column not found in current board state')
+      }
+
+      const sameColumn = before.columnId === targetColumnId
+      const targetList = cards.value[targetColumnId]
+      const upperBound = sameColumn ? targetList.length - 1 : targetList.length
+      const targetIndex = position === undefined || position === null
+        ? upperBound
+        : Math.min(Math.max(Number(position), 0), upperBound)
+
+      if (!(sameColumn && targetIndex === before.index)) {
+        applyLocalMove(cardId, targetColumnId, targetIndex)
+      }
+
+      try {
+        const res = await cardApi.move(cardId, targetColumnId, targetIndex)
+        // Canonicalize from the server response: replace card content and
+        // position, then realign every column to gap-free index numbering.
+        const canonical = res.data
+        const local = findCard(cardId)
+        if (local) {
+          local.list[local.index] = { ...local.list[local.index], ...canonical }
+        }
+        renumberAll()
+        return canonical
+      } catch (err) {
+        await resyncCards()
+        throw err
+      }
+    })
+    // Keep the chain alive even when this individual move fails.
+    moveQueue = task.catch(() => {})
+    return task
   }
 
   function clearBoard() {
