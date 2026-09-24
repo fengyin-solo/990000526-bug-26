@@ -68,7 +68,6 @@
       :card="selectedCard"
       :all-columns="boardStore.columns"
       @updated="onCardUpdated"
-      @move="handleMoveCard"
     />
   </div>
 </template>
@@ -80,7 +79,6 @@ import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, ArrowLeft, Loading } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import { useBoardStore } from '../stores/board.js'
-import { columnApi } from '../api/index.js'
 import Column from '../components/Column.vue'
 import AddCardForm from '../components/AddCardForm.vue'
 import CardDetail from '../components/CardDetail.vue'
@@ -172,6 +170,7 @@ async function handleMoveCard(cardId, targetColumnId, position) {
     await boardStore.moveCard(cardId, targetColumnId, position)
     ElMessage.success('Card moved')
   } catch (err) {
+    // moveCard already resynced the board from the server on failure.
     ElMessage.error('Failed to move card')
   }
 }
@@ -203,20 +202,18 @@ async function confirmDeleteColumn(column) {
   }
 }
 
-async function onColumnDragEnd(evt) {
-  // Update column positions after drag
+async function onColumnDragEnd() {
+  // The server applies proper shifting for a single reorder call; on failure
+  // the store refreshes columns and cards together so counts never diverge.
   const columns = boardStore.columns
-  for (let i = 0; i < columns.length; i++) {
-    if (columns[i].position !== i) {
-      try {
-        await columnApi.update(columns[i].id, { position: i })
-        columns[i].position = i
-      } catch (err) {
-        // Refresh to get correct state
-        await boardStore.fetchColumns(boardStore.currentBoard.id)
-        break
-      }
-    }
+  const moved = columns
+    .map((col, i) => ({ col, index: i }))
+    .find(({ col, index }) => col.position !== index)
+  if (!moved) return
+  try {
+    await boardStore.reorderColumn(moved.col.id, moved.index)
+  } catch (err) {
+    ElMessage.error('Failed to reorder column')
   }
 }
 </script>

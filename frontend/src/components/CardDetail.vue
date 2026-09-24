@@ -105,6 +105,8 @@ async function handleSave() {
 
   saving.value = true
   try {
+    // Keep card content separate from position: update first, then move
+    // through the same canonical path used by drag and the card menu.
     const updated = await boardStore.updateCard(props.card.id, {
       title: form.value.title,
       description: form.value.description,
@@ -114,15 +116,14 @@ async function handleSave() {
     emit('updated', updated)
     ElMessage.success('Card updated')
 
-    // Handle move if target column selected
     if (moveTarget.value && moveTarget.value !== props.card.column_id) {
-      await boardStore.moveCard(props.card.id, moveTarget.value, 0)
-      ElMessage.success('Card moved')
+      const moved = await boardStore.moveCard(props.card.id, moveTarget.value)
+      emit('updated', moved)
     }
 
     emit('update:visible', false)
   } catch (err) {
-    ElMessage.error('Failed to update card')
+    ElMessage.error('Failed to save card')
   } finally {
     saving.value = false
   }

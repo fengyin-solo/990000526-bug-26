@@ -1,5 +1,5 @@
 <template>
-  <div class="column">
+  <div class="column" :data-column-id="String(column.id)">
     <div class="column-header">
       <div v-if="!isEditing" class="column-title" @dblclick="startEditing">
         <h3>{{ column.name }}</h3>
@@ -40,7 +40,7 @@
             :all-columns="allColumns"
             @edit="$emit('edit-card', card)"
             @delete="$emit('delete-card', card)"
-            @move="(targetColId) => $emit('move-card', card.id, targetColId, 0)"
+            @move="(targetColId) => $emit('move-card', card.id, targetColId)"
           />
         </template>
       </draggable>
@@ -59,7 +59,6 @@ import { ref, nextTick } from 'vue'
 import { MoreFilled, Plus } from '@element-plus/icons-vue'
 import draggable from 'vuedraggable'
 import TaskCard from './TaskCard.vue'
-import { cardApi } from '../api/index.js'
 
 const props = defineProps({
   column: { type: Object, required: true },
@@ -96,26 +95,35 @@ function handleCommand(command) {
   }
 }
 
-async function onCardDragEnd(evt) {
+function columnIdFromEl(el) {
+  const wrapper = el?.closest?.('[data-column-id]')
+  return wrapper ? Number(wrapper.dataset.columnId) : null
+}
+
+function onCardDragEnd(evt) {
+  // Sortable fires `end` only on the source list. Determine the canonical
+  // source/destination/position from the drag event and let the store
+  // apply the exact same rules used by menu moves and retries.
   const cardId = evt.item?.__draggable_context?.element?.id
-  const toColumnId = props.column.id
-  
-  // Find source column
-  const fromContext = evt.from.__draggable_context
-  const toContext = evt.to.__draggable_context
-  
-  if (!cardId) return
-  
-  const newIndex = evt.newIndex
-  
-  // If moved to a different column, update via API
-  if (evt.from !== evt.to) {
-    try {
-      await cardApi.move(cardId, toColumnId, newIndex)
-    } catch (err) {
-      // Refresh would be needed here, but the store handles it
-    }
+  if (cardId == null) return
+
+  const sourceColumnId = columnIdFromEl(evt.from)
+  const targetColumnId = columnIdFromEl(evt.to)
+  if (sourceColumnId == null || targetColumnId == null) return
+
+  const rawIndex = Number.isInteger(evt.newIndex) ? evt.newIndex : null
+  if (rawIndex === null) return
+  if (sourceColumnId === targetColumnId && rawIndex === evt.oldIndex) return
+
+  // Sortable's newIndex counts the dragged item while it is still in the
+  // list; the canonical move position is a post-removal insertion index,
+  // so shift same-column forward drops by one.
+  let position = rawIndex
+  if (sourceColumnId === targetColumnId && Number.isInteger(evt.oldIndex) && rawIndex > evt.oldIndex) {
+    position -= 1
   }
+
+  emit('move-card', cardId, targetColumnId, position)
 }
 </script>
 

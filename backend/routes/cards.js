@@ -148,11 +148,13 @@ router.delete('/cards/:id', (req, res) => {
 
     db.prepare('DELETE FROM cards WHERE id = ?').run(req.params.id);
 
-    // Reorder remaining cards in the column
-    db.prepare(`
-      UPDATE cards SET position = position - 1 
-      WHERE column_id = ? AND position > ?
-    `).run(card.column_id, card.position);
+    // Renumber remaining cards in the column to dense positions
+    const remaining = db.prepare(`
+      SELECT id FROM cards WHERE column_id = ? ORDER BY position ASC
+    `).all(card.column_id);
+    remaining.forEach((row, i) => {
+      db.prepare('UPDATE cards SET position = ? WHERE id = ?').run(i, row.id);
+    });
 
     db.close();
     res.json({ message: 'Card deleted' });
@@ -162,7 +164,7 @@ router.delete('/cards/:id', (req, res) => {
   }
 });
 
-// PUT /api/cards/:id/move - Move card to another column
+// PUT /api/cards/:id/move - Move card to another column / position
 router.put('/cards/:id/move', (req, res) => {
   const { columnId, position } = req.body;
   if (!columnId) {
@@ -179,8 +181,8 @@ router.put('/cards/:id/move', (req, res) => {
 
     // Verify target column belongs to same board and user
     const targetCol = db.prepare(`
-      SELECT col.*, b.user_id FROM columns col 
-      JOIN boards b ON col.board_id = b.id 
+      SELECT col.*, b.user_id FROM columns col
+      JOIN boards b ON col.board_id = b.id
       WHERE col.id = ? AND col.board_id = ?
     `).get(columnId, card.board_id);
 
@@ -190,31 +192,79 @@ router.put('/cards/:id/move', (req, res) => {
     }
 
     const oldColumnId = card.column_id;
-    const oldPosition = card.position;
+    const targetColumnId = targetCol.id;
 
-    // Get max position in target column
-    const maxPos = db.prepare('SELECT MAX(position) AS maxPos FROM cards WHERE column_id = ?').get(columnId);
-    const newPosition = position !== undefined ? Math.min(position, (maxPos.maxPos ?? -1) + 1) : (maxPos.maxPos ?? -1) + 1;
+    // Canonical rules (must match the frontend store):
+    //  - position is a 0-based dense index in the destination column
+    //  - allowed upper bound is the destination length *after* the card is
+    //    removed, so same-column moves can never leave a gap
+    //  - missing / invalid position means "append to end"
+    const targetCountRow = db.prepare(
+      'SELECT COUNT(*) AS cnt FROM cards WHERE column_id = ?'
+    ).get(targetColumnId);
+    const upperBound = targetCountRow.cnt - (oldColumnId === targetColumnId ? 1 : 0);
 
-    // Remove card from old position (shift cards down in old column)
-    db.prepare(`
-      UPDATE cards SET position = position - 1 
-      WHERE column_id = ? AND position > ?
-    `).run(oldColumnId, oldPosition);
+    let newPosition;
+    if (position === undefined || position === null) {
+      newPosition = upperBound;
+    } else {
+      newPosition = Math.trunc(Number(position));
+      // Only non-negative integers are valid positions; negative or NaN
+      // values fall back to the end of the column.
+      if (!Number.isInteger(newPosition) || newPosition < 0) {
+        newPosition = upperBound;
+      }
+      newPosition = Math.min(newPosition, upperBound);
+    }
 
-    // Make room in target column (shift cards up in target column)
-    db.prepare(`
-      UPDATE cards SET position = position + 1 
-      WHERE column_id = ? AND position >= ?
-    `).run(columnId, newPosition);
+    if (oldColumnId === targetColumnId && card.position === newPosition) {
+      db.close();
+      return res.json(card);
+    }
 
-    // Move the card
-    db.prepare(`
-      UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now') 
-      WHERE id = ?
-    `).run(columnId, newPosition, req.params.id);
+    // Apply the move and renumber to dense 0..n-1 positions atomically.
+    const moveTxn = db.transaction(() => {
+      if (oldColumnId === targetColumnId) {
+        // Reorder within the same column: snapshot the other cards in
+        // their current order, move the card, then compress to dense.
+        const others = db.prepare(`
+          SELECT id, position FROM cards
+          WHERE column_id = ? AND id != ?
+          ORDER BY position ASC
+        `).all(targetColumnId, card.id);
 
-    const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(req.params.id);
+        db.prepare(`
+          UPDATE cards SET position = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(newPosition, card.id);
+
+        others.forEach((row, i) => {
+          const densePos = i >= newPosition ? i + 1 : i;
+          if (row.position !== densePos) {
+            db.prepare('UPDATE cards SET position = ? WHERE id = ?').run(densePos, row.id);
+          }
+        });
+      } else {
+        // Close the gap in the old column and open one in the new column.
+        db.prepare(`
+          UPDATE cards SET position = position - 1
+          WHERE column_id = ? AND position > ?
+        `).run(oldColumnId, card.position);
+
+        db.prepare(`
+          UPDATE cards SET position = position + 1
+          WHERE column_id = ? AND position >= ?
+        `).run(targetColumnId, newPosition);
+
+        db.prepare(`
+          UPDATE cards SET column_id = ?, position = ?, updated_at = datetime('now')
+          WHERE id = ?
+        `).run(targetColumnId, newPosition, card.id);
+      }
+    });
+    moveTxn();
+
+    const updated = db.prepare('SELECT * FROM cards WHERE id = ?').get(card.id);
     db.close();
     res.json(updated);
   } catch (err) {
